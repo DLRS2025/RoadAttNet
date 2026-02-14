@@ -44,23 +44,9 @@ Road extraction from remote sensing imagery is challenging due to complex backgr
 - **Massachusetts Roads Dataset** (`massazhusai`)
 - **Lanzhou Dataset:** available via `baidu.pan` (please provide link/code if you plan to share)
 
-> If you would like, you can add:
 > - dataset download links
 > - preprocessing steps
 > - train/val/test split details
 > - licensing and citation requirements
 
 ---
-
-## Project Structure (Recommended)
-
-```text
-.
-├── config.py
-├── dataset.py
-├── infer.py
-├── losses.py
-├── model.py
-├── test.py
-├── train.py
-└── visualize.py
