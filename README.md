@@ -25,7 +25,7 @@ Road extraction from remote sensing imagery is challenging due to complex backgr
 
 ## Overview
 
-<img width="933" height="836" alt="image" src="https://github.com/user-attachments/assets/028a4fc4-b2be-470f-8558-32b56206bc84" />
+<img width="700" height="600" alt="image" src="https://github.com/user-attachments/assets/028a4fc4-b2be-470f-8558-32b56206bc84" />
 
 **Fig. 1.** Overall framework of this study.
 
@@ -33,7 +33,7 @@ Road extraction from remote sensing imagery is challenging due to complex backgr
 
 ## Model: RoadAttNet
 
-<img width="934" height="559" alt="image" src="https://github.com/user-attachments/assets/910799a6-6c63-4f76-9e45-a816e35d14ef" />
+<img width="700" height="400" alt="image" src="https://github.com/user-attachments/assets/910799a6-6c63-4f76-9e45-a816e35d14ef" />
 
 **Fig. 2.** The architecture diagram of RoadAttNet.
 
@@ -41,12 +41,17 @@ Road extraction from remote sensing imagery is challenging due to complex backgr
 
 ## Datasets
 
-- **Massachusetts Roads Dataset** (`massazhusai`)
-- **Lanzhou Dataset:** available via `baidu.pan` (please provide link/code if you plan to share)
+### 1) Lanzhou Dataset (self-built)
+The self-constructed Lanzhou Dataset is available via Baidu Netdisk (TODO: add download link and extraction code if you plan to share).
 
-> - dataset download links
-> - preprocessing steps
-> - train/val/test split details
-> - licensing and citation requirements
+### 2) Massachusetts Roads Dataset
+- Download: https://www.cs.toronto.edu/~vmnih/data/
 
----
+**Citation**
+```bibtex
+@phdthesis{MnihThesis,
+  author = {Volodymyr Mnih},
+  title  = {Machine Learning for Aerial Image Labeling},
+  school = {University of Toronto},
+  year   = {2013}
+}
