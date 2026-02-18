@@ -42,7 +42,7 @@ Road extraction from remote sensing imagery is challenging due to complex backgr
 ## Datasets
 
 ### 1) Lanzhou Dataset (self-built)
-The self-constructed Lanzhou Dataset is available via Baidu Netdisk (https://pan.baidu.com/s/1bWp0OVNdpVEJ1KIt5Y3oEg) 提取码: rbau.
+The self-constructed Lanzhou Dataset is available via Baidu Netdisk (https://pan.baidu.com/s/1bWp0OVNdpVEJ1KIt5Y3oEg) 提取码: ua61.
 
 ### 2) Massachusetts Roads Dataset
 - Download: https://www.cs.toronto.edu/~vmnih/data/
