@@ -1,337 +1,297 @@
 import numpy as np
-import tensorflow as tf
-from tensorflow.keras import layers
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from losses import composite_loss
 
-
 def _bilinear_sample(img, coords_y, coords_x):
-    img = tf.convert_to_tensor(img)
-    B = tf.shape(img)[0]
-    H = tf.shape(img)[1]
-    W = tf.shape(img)[2]
-    y = coords_y
-    x = coords_x
-    y0 = tf.floor(y)
-    x0 = tf.floor(x)
-    y1 = y0 + 1.0
-    x1 = x0 + 1.0
-    y0i = tf.clip_by_value(tf.cast(y0, tf.int32), 0, H - 1)
-    x0i = tf.clip_by_value(tf.cast(x0, tf.int32), 0, W - 1)
-    y1i = tf.clip_by_value(tf.cast(y1, tf.int32), 0, H - 1)
-    x1i = tf.clip_by_value(tf.cast(x1, tf.int32), 0, W - 1)
-
-    b = tf.range(B, dtype=tf.int32)[:, None, None]
-    b = tf.tile(b, [1, H, W])
-
-    def gather(y_idx, x_idx):
-        idx = tf.stack([b, y_idx, x_idx], axis=-1)
-        return tf.gather_nd(img, idx)
-
-    Ia = gather(y0i, x0i)
-    Ib = gather(y1i, x0i)
-    Ic = gather(y0i, x1i)
-    Id = gather(y1i, x1i)
-
-    y0f = tf.cast(y0i, tf.float32)
-    x0f = tf.cast(x0i, tf.float32)
-    y1f = tf.cast(y1i, tf.float32)
-    x1f = tf.cast(x1i, tf.float32)
-
-    wa = (x1f - x) * (y1f - y)
-    wb = (x1f - x) * (y - y0f)
-    wc = (x - x0f) * (y1f - y)
-    wd = (x - x0f) * (y - y0f)
-
-    wa = tf.expand_dims(wa, axis=-1)
-    wb = tf.expand_dims(wb, axis=-1)
-    wc = tf.expand_dims(wc, axis=-1)
-    wd = tf.expand_dims(wd, axis=-1)
-
-    out = wa * Ia + wb * Ib + wc * Ic + wd * Id
-    return out
+    # img: [B, C, H, W]
+    # coords_y, coords_x: [B, 1, H, W]
+    B, C, H, W = img.shape
+    
+    # Normalize coordinates to [-1, 1] for grid_sample
+    norm_x = 2.0 * coords_x / (W - 1) - 1.0
+    norm_y = 2.0 * coords_y / (H - 1) - 1.0
+    
+    # grid_sample expects grid of shape [B, H, W, 2] with (x, y) coordinates
+    grid = torch.cat([norm_x, norm_y], dim=1) # [B, 2, H, W]
+    grid = grid.permute(0, 2, 3, 1) # [B, H, W, 2]
+    
+    return F.grid_sample(img, grid, mode='bilinear', padding_mode='border', align_corners=True)
 
 
-class OrientedCoordinateAttention(layers.Layer):
-    def __init__(self, length=9, reduction=8, **kwargs):
-        super().__init__(**kwargs)
+class OrientedCoordinateAttention(nn.Module):
+    def __init__(self, in_channels, length=9, reduction=8):
+        super().__init__()
         self.length = int(length)
         self.reduction = int(reduction)
-
-    def build(self, input_shape):
-        C = int(input_shape[-1])
-        hidden = max(8, C // self.reduction)
-        self.theta_conv3 = layers.Conv2D(hidden, 3, padding="same", activation="relu")
-        self.theta_conv1 = layers.Conv2D(1, 1, padding="same", activation="sigmoid")
-        self.attn_reduce = layers.Conv2D(hidden, 1, padding="same", activation="relu")
-        self.attn_expand = layers.Conv2D(2 * C, 1, padding="same", activation="sigmoid")
-        super().build(input_shape)
+        hidden = max(8, in_channels // self.reduction)
+        
+        self.theta_conv3 = nn.Sequential(
+            nn.Conv2d(in_channels, hidden, 3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        self.theta_conv1 = nn.Sequential(
+            nn.Conv2d(hidden, 1, 1, padding=0),
+            nn.Sigmoid()
+        )
+        self.attn_reduce = nn.Sequential(
+            nn.Conv2d(in_channels * 2, hidden, 1, padding=0),
+            nn.ReLU(inplace=True)
+        )
+        self.attn_expand = nn.Sequential(
+            nn.Conv2d(hidden, 2 * in_channels, 1, padding=0),
+            nn.Sigmoid()
+        )
 
     def _oriented_pool(self, x, vx, vy):
-        B = tf.shape(x)[0]
-        H = tf.shape(x)[1]
-        W = tf.shape(x)[2]
-        yy, xx = tf.meshgrid(tf.range(H, dtype=tf.float32), tf.range(W, dtype=tf.float32), indexing="ij")
-        yy = tf.reshape(yy, [1, H, W, 1])
-        xx = tf.reshape(xx, [1, H, W, 1])
-        yy = tf.tile(yy, [B, 1, 1, 1])
-        xx = tf.tile(xx, [B, 1, 1, 1])
+        B, C, H, W = x.shape
+        device = x.device
+        
+        yy, xx = torch.meshgrid(torch.arange(H, dtype=torch.float32, device=device), 
+                                torch.arange(W, dtype=torch.float32, device=device), indexing="ij")
+        yy = yy.reshape(1, 1, H, W).expand(B, -1, -1, -1)
+        xx = xx.reshape(1, 1, H, W).expand(B, -1, -1, -1)
+        
         half = self.length // 2
-        offsets = tf.range(-half, half + 1, dtype=tf.float32)
+        offsets = torch.arange(-half, half + 1, dtype=torch.float32, device=device)
+        
         acc = 0.0
-        for t in tf.unstack(offsets):
+        for t in offsets:
             coords_y = yy + t * vy
             coords_x = xx + t * vx
-            sample = _bilinear_sample(x, tf.squeeze(coords_y, -1), tf.squeeze(coords_x, -1))
+            sample = _bilinear_sample(x, coords_y, coords_x)
             acc = acc + sample
-        return acc / tf.cast(self.length, tf.float32)
+        return acc / float(self.length)
 
-    def call(self, x):
+    def forward(self, x):
         theta = np.pi * self.theta_conv1(self.theta_conv3(x))
-        cos_t = tf.cos(theta)
-        sin_t = tf.sin(theta)
+        cos_t = torch.cos(theta)
+        sin_t = torch.sin(theta)
+        
         vtan_x, vtan_y = cos_t, sin_t
         vnor_x, vnor_y = -sin_t, cos_t
+        
         tan_feat = self._oriented_pool(x, vtan_x, vtan_y)
         nor_feat = self._oriented_pool(x, vnor_x, vnor_y)
-        context = tf.concat([tan_feat, nor_feat], axis=-1)
+        
+        context = torch.cat([tan_feat, nor_feat], dim=1)
         w = self.attn_expand(self.attn_reduce(context))
-        alpha_tan, alpha_norm = tf.split(w, num_or_size_splits=2, axis=-1)
+        
+        alpha_tan, alpha_norm = torch.chunk(w, 2, dim=1)
         return (alpha_tan + alpha_norm) * x
 
 
-def residual_block(x, filters):
-    shortcut = x
-    x = layers.Conv2D(filters, 3, padding="same", use_bias=False)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.ReLU()(x)
-    x = layers.Conv2D(filters, 3, padding="same", use_bias=False)(x)
-    x = layers.BatchNormalization()(x)
-    if shortcut.shape[-1] != filters:
-        shortcut = layers.Conv2D(filters, 1, padding="same", use_bias=False)(shortcut)
-        shortcut = layers.BatchNormalization()(shortcut)
-    x = layers.Add()([x, shortcut])
-    x = layers.ReLU()(x)
-    return x
-
-
-def multiscale_rgb_branch(rgb, base_filters=32):
-    f0 = layers.Conv2D(base_filters, 3, padding="same", activation="relu")(rgb)
-    d2 = layers.AveragePooling2D(pool_size=2)(rgb)
-    d2 = layers.Conv2D(base_filters, 3, padding="same", activation="relu")(d2)
-    u2 = layers.UpSampling2D(size=2, interpolation="bilinear")(d2)
-    d4 = layers.AveragePooling2D(pool_size=4)(rgb)
-    d4 = layers.Conv2D(base_filters, 3, padding="same", activation="relu")(d4)
-    u4 = layers.UpSampling2D(size=4, interpolation="bilinear")(d4)
-    ms = layers.Concatenate()([f0, u2, u4])
-    ms = layers.Conv2D(base_filters * 2, 1, padding="same", activation="relu")(ms)
-    return ms
-
-
-def multidim_prior_branch(prior, out_filters=64):
-    x = layers.Conv2D(out_filters, 3, padding="same", activation="relu")(prior)
-    x = layers.Conv2D(out_filters, 3, padding="same", activation="relu")(x)
-    x = layers.Conv2D(out_filters, 1, padding="same", activation="relu")(x)
-    return x
-
-
-def build_roadattnet_core(input_shape=(512, 512, 4), base_filters=64, oca_length=9):
-    inp = layers.Input(shape=input_shape)
-    rgb = inp[..., :3]
-    prior = inp[..., 3:4]
-
-    rgb_ms = multiscale_rgb_branch(rgb, base_filters=base_filters // 2)
-    prior_f = multidim_prior_branch(prior, out_filters=base_filters)
-
-    x0 = layers.Concatenate()([rgb_ms, prior_f])
-    e1 = residual_block(x0, base_filters)
-    p1 = layers.MaxPooling2D(pool_size=2)(e1)
-
-    e2 = residual_block(p1, base_filters * 2)
-    p2 = layers.MaxPooling2D(pool_size=2)(e2)
-
-    e3 = residual_block(p2, base_filters * 4)
-    p3 = layers.MaxPooling2D(pool_size=2)(e3)
-
-    e4 = residual_block(p3, base_filters * 8)
-    p4 = layers.MaxPooling2D(pool_size=2)(e4)
-
-    bott = residual_block(p4, base_filters * 16)
-
-    oca1 = OrientedCoordinateAttention(length=oca_length, name="oca_d4")
-    oca2 = OrientedCoordinateAttention(length=oca_length, name="oca_d3")
-    oca3 = OrientedCoordinateAttention(length=oca_length, name="oca_d2")
-    oca4 = OrientedCoordinateAttention(length=oca_length, name="oca_d1")
-
-    d4 = layers.UpSampling2D(size=2, interpolation="bilinear")(bott)
-    d4 = layers.Concatenate()([d4, e4])
-    d4 = oca1(d4)
-    d4 = residual_block(d4, base_filters * 8)
-    aux1 = layers.Conv2D(1, 1, activation="sigmoid", name="aux1_raw")(d4)
-    aux1_up = layers.UpSampling2D(size=8, interpolation="bilinear", name="aux1")(aux1)
-
-    d3 = layers.UpSampling2D(size=2, interpolation="bilinear")(d4)
-    d3 = layers.Concatenate()([d3, e3])
-    d3 = oca2(d3)
-    d3 = residual_block(d3, base_filters * 4)
-    aux2 = layers.Conv2D(1, 1, activation="sigmoid", name="aux2_raw")(d3)
-    aux2_up = layers.UpSampling2D(size=4, interpolation="bilinear", name="aux2")(aux2)
-
-    d2 = layers.UpSampling2D(size=2, interpolation="bilinear")(d3)
-    d2 = layers.Concatenate()([d2, e2])
-    d2 = oca3(d2)
-    d2 = residual_block(d2, base_filters * 2)
-    aux3 = layers.Conv2D(1, 1, activation="sigmoid", name="aux3_raw")(d2)
-    aux3_up = layers.UpSampling2D(size=2, interpolation="bilinear", name="aux3")(aux3)
-
-    d1 = layers.UpSampling2D(size=2, interpolation="bilinear")(d2)
-    d1 = layers.Concatenate()([d1, e1])
-    d1 = oca4(d1)
-    d1 = residual_block(d1, base_filters)
-    main = layers.Conv2D(1, 1, activation="sigmoid", name="main")(d1)
-
-    return tf.keras.Model(inputs=inp, outputs=[main, aux1_up, aux2_up, aux3_up], name="RoadAttNetCore")
-
-
-class RoadAttNet(tf.keras.Model):
-    def __init__(self, core: tf.keras.Model, grad_accum_steps: int = 1, grad_clip_norm: float = 0.0, **kwargs):
-        super().__init__(**kwargs)
-        self.core = core
-        self.grad_accum_steps = int(max(1, grad_accum_steps))
-        self.grad_clip_norm = float(max(0.0, grad_clip_norm))
-
-        self.s1 = self.add_weight(name="s1", shape=(), initializer="zeros", trainable=True)
-        self.s2 = self.add_weight(name="s2", shape=(), initializer="zeros", trainable=True)
-        self.s3 = self.add_weight(name="s3", shape=(), initializer="zeros", trainable=True)
-
-        self.loss_tracker = tf.keras.metrics.Mean(name="loss")
-        self.main_loss_tracker = tf.keras.metrics.Mean(name="main_loss")
-        self.aux_loss_tracker = tf.keras.metrics.Mean(name="aux_loss")
-        self.acc = tf.keras.metrics.BinaryAccuracy(name="accuracy")
-        self.recall = tf.keras.metrics.Recall(name="recall")
-        self.iou = tf.keras.metrics.MeanIoU(num_classes=2, name="iou")
-
-        self._accum_step = None
-        self._accum_grads = None
-        self._var_index = None
-
-    @property
-    def metrics(self):
-        return [self.loss_tracker, self.main_loss_tracker, self.aux_loss_tracker, self.acc, self.recall, self.iou]
-
-    def build(self, input_shape):
-        self.core.build(input_shape)
-        super().build(input_shape)
-        self._var_index = {v.ref(): i for i, v in enumerate(self.trainable_variables)}
-        if self.grad_accum_steps > 1 and self._accum_grads is None:
-            self._accum_step = self.add_weight(name="accum_step", shape=(), dtype=tf.int32, initializer="zeros", trainable=False)
-            self._accum_grads = []
-            for v in self.trainable_variables:
-                self._accum_grads.append(
-                    self.add_weight(
-                        name=("accum_" + v.name.replace(":", "_")),
-                        shape=v.shape,
-                        dtype=tf.float32,
-                        initializer="zeros",
-                        trainable=False,
-                    )
-                )
-
-    def call(self, inputs, training=False):
-        return self.core(inputs, training=training)
-
-    def _update_iou(self, y_true, y_pred):
-        y_true_i = tf.cast(y_true > 0.5, tf.int32)
-        y_pred_i = tf.cast(y_pred > 0.5, tf.int32)
-        self.iou.update_state(y_true_i, y_pred_i)
-
-    def _compute_total_loss(self, y, main, aux1, aux2, aux3):
-        L_main = composite_loss(y, main)
-        L1 = composite_loss(y, aux1)
-        L2 = composite_loss(y, aux2)
-        L3 = composite_loss(y, aux3)
-        aux_term = (
-            0.5 * tf.exp(-2.0 * self.s1) * L1 + self.s1
-            + 0.5 * tf.exp(-2.0 * self.s2) * L2 + self.s2
-            + 0.5 * tf.exp(-2.0 * self.s3) * L3 + self.s3
-        )
-        loss = L_main + aux_term
-        loss += tf.add_n(self.losses) if self.losses else 0.0
-        return loss, L_main, (L1 + L2 + L3) / 3.0
-
-    def _maybe_scale_loss(self, loss):
-        if hasattr(self.optimizer, "get_scaled_loss"):
-            return self.optimizer.get_scaled_loss(loss), True
-        return loss, False
-
-    def _maybe_unscale_grads(self, grads, scaled: bool):
-        if scaled and hasattr(self.optimizer, "get_unscaled_gradients"):
-            return self.optimizer.get_unscaled_gradients(grads)
-        return grads
-
-    def train_step(self, data):
-        x, y = data
-        with tf.GradientTape() as tape:
-            main, aux1, aux2, aux3 = self(x, training=True)
-            loss, L_main, L_aux = self._compute_total_loss(y, main, aux1, aux2, aux3)
-            scaled_loss, scaled = self._maybe_scale_loss(loss)
-
-        grads = tape.gradient(scaled_loss, self.trainable_variables)
-        grads = self._maybe_unscale_grads(grads, scaled)
-
-        if self.grad_clip_norm > 0:
-            g_non = [g for g in grads if g is not None]
-            if g_non:
-                g_non, _ = tf.clip_by_global_norm(g_non, self.grad_clip_norm)
-                it = iter(g_non)
-                grads = [next(it) if g is not None else None for g in grads]
-
-        if self.grad_accum_steps == 1:
-            self.optimizer.apply_gradients([(g, v) for g, v in zip(grads, self.trainable_variables) if g is not None])
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, filters):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, filters, 3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(filters)
+        self.relu1 = nn.ReLU(inplace=True)
+        
+        self.conv2 = nn.Conv2d(filters, filters, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(filters)
+        
+        if in_channels != filters:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, filters, 1, padding=0, bias=False),
+                nn.BatchNorm2d(filters)
+            )
         else:
-            if self._accum_grads is None:
-                raise RuntimeError("Accum buffers not built")
-            for i, g in enumerate(grads):
-                if g is not None:
-                    self._accum_grads[i].assign_add(tf.cast(g, tf.float32))
-            self._accum_step.assign_add(1)
+            self.shortcut = nn.Identity()
+            
+        self.relu2 = nn.ReLU(inplace=True)
 
-            def _apply():
-                mean_grads = []
-                mean_vars = []
-                for i, v in enumerate(self.trainable_variables):
-                    g = self._accum_grads[i] / float(self.grad_accum_steps)
-                    mean_grads.append(tf.cast(g, v.dtype))
-                    mean_vars.append(v)
-                self.optimizer.apply_gradients(list(zip(mean_grads, mean_vars)))
-                for gb in self._accum_grads:
-                    gb.assign(tf.zeros_like(gb))
-                self._accum_step.assign(0)
-                return 0
+    def forward(self, x):
+        shortcut = self.shortcut(x)
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu1(x)
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = x + shortcut
+        x = self.relu2(x)
+        return x
 
-            tf.cond(tf.equal(self._accum_step, self.grad_accum_steps), _apply, lambda: 0)
 
-        self.loss_tracker.update_state(loss)
-        self.main_loss_tracker.update_state(L_main)
-        self.aux_loss_tracker.update_state(L_aux)
+class MultiscaleRGBBranch(nn.Module):
+    def __init__(self, in_channels, base_filters=32):
+        super().__init__()
+        self.f0 = nn.Sequential(
+            nn.Conv2d(in_channels, base_filters, 3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.pool2 = nn.AvgPool2d(2)
+        self.conv_d2 = nn.Sequential(
+            nn.Conv2d(in_channels, base_filters, 3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.pool4 = nn.AvgPool2d(4)
+        self.conv_d4 = nn.Sequential(
+            nn.Conv2d(in_channels, base_filters, 3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.ms_conv = nn.Sequential(
+            nn.Conv2d(base_filters * 3, base_filters * 2, 1, padding=0),
+            nn.ReLU(inplace=True)
+        )
 
-        self.acc.update_state(y, main)
-        self.recall.update_state(y, main)
-        self._update_iou(y, main)
+    def forward(self, rgb):
+        f0 = self.f0(rgb)
+        
+        d2 = self.pool2(rgb)
+        d2 = self.conv_d2(d2)
+        u2 = F.interpolate(d2, scale_factor=2, mode="bilinear", align_corners=False)
+        
+        d4 = self.pool4(rgb)
+        d4 = self.conv_d4(d4)
+        u4 = F.interpolate(d4, scale_factor=4, mode="bilinear", align_corners=False)
+        
+        ms = torch.cat([f0, u2, u4], dim=1)
+        ms = self.ms_conv(ms)
+        return ms
 
-        return {m.name: m.result() for m in self.metrics}
 
-    def test_step(self, data):
-        x, y = data
-        main, aux1, aux2, aux3 = self(x, training=False)
-        loss, L_main, L_aux = self._compute_total_loss(y, main, aux1, aux2, aux3)
+class MultidimPriorBranch(nn.Module):
+    def __init__(self, in_channels, out_filters=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, out_filters, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_filters, out_filters, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_filters, out_filters, 1, padding=0),
+            nn.ReLU(inplace=True)
+        )
 
-        self.loss_tracker.update_state(loss)
-        self.main_loss_tracker.update_state(L_main)
-        self.aux_loss_tracker.update_state(L_aux)
+    def forward(self, prior):
+        return self.net(prior)
 
-        self.acc.update_state(y, main)
-        self.recall.update_state(y, main)
-        self._update_iou(y, main)
 
-        return {m.name: m.result() for m in self.metrics}
+class RoadAttNetCore(nn.Module):
+    def __init__(self, base_filters=64, oca_length=9):
+        super().__init__()
+        
+        self.rgb_ms = MultiscaleRGBBranch(3, base_filters=base_filters // 2)
+        self.prior_f = MultidimPriorBranch(1, out_filters=base_filters)
+        
+        in_ch = (base_filters // 2) * 2 + base_filters
+        
+        self.e1 = ResidualBlock(in_ch, base_filters)
+        self.p1 = nn.MaxPool2d(2)
+        
+        self.e2 = ResidualBlock(base_filters, base_filters * 2)
+        self.p2 = nn.MaxPool2d(2)
+        
+        self.e3 = ResidualBlock(base_filters * 2, base_filters * 4)
+        self.p3 = nn.MaxPool2d(2)
+        
+        self.e4 = ResidualBlock(base_filters * 4, base_filters * 8)
+        self.p4 = nn.MaxPool2d(2)
+        
+        self.bott = ResidualBlock(base_filters * 8, base_filters * 16)
+        
+        self.oca1 = OrientedCoordinateAttention(base_filters * 16 + base_filters * 8, length=oca_length)
+        self.d4_res = ResidualBlock(base_filters * 16 + base_filters * 8, base_filters * 8)
+        self.aux1 = nn.Sequential(nn.Conv2d(base_filters * 8, 1, 1), nn.Sigmoid())
+        
+        self.oca2 = OrientedCoordinateAttention(base_filters * 8 + base_filters * 4, length=oca_length)
+        self.d3_res = ResidualBlock(base_filters * 8 + base_filters * 4, base_filters * 4)
+        self.aux2 = nn.Sequential(nn.Conv2d(base_filters * 4, 1, 1), nn.Sigmoid())
+        
+        self.oca3 = OrientedCoordinateAttention(base_filters * 4 + base_filters * 2, length=oca_length)
+        self.d2_res = ResidualBlock(base_filters * 4 + base_filters * 2, base_filters * 2)
+        self.aux3 = nn.Sequential(nn.Conv2d(base_filters * 2, 1, 1), nn.Sigmoid())
+        
+        self.oca4 = OrientedCoordinateAttention(base_filters * 2 + base_filters, length=oca_length)
+        self.d1_res = ResidualBlock(base_filters * 2 + base_filters, base_filters)
+        self.main = nn.Sequential(nn.Conv2d(base_filters, 1, 1), nn.Sigmoid())
+
+    def forward(self, x):
+        rgb = x[:, :3, ...]
+        prior = x[:, 3:4, ...]
+        
+        rgb_ms = self.rgb_ms(rgb)
+        prior_f = self.prior_f(prior)
+        
+        x0 = torch.cat([rgb_ms, prior_f], dim=1)
+        
+        e1 = self.e1(x0)
+        p1 = self.p1(e1)
+        
+        e2 = self.e2(p1)
+        p2 = self.p2(e2)
+        
+        e3 = self.e3(p2)
+        p3 = self.p3(e3)
+        
+        e4 = self.e4(p3)
+        p4 = self.p4(e4)
+        
+        bott = self.bott(p4)
+        
+        d4 = F.interpolate(bott, scale_factor=2, mode="bilinear", align_corners=False)
+        d4 = torch.cat([d4, e4], dim=1)
+        d4 = self.oca1(d4)
+        d4 = self.d4_res(d4)
+        aux1 = self.aux1(d4)
+        aux1_up = F.interpolate(aux1, scale_factor=8, mode="bilinear", align_corners=False)
+        
+        d3 = F.interpolate(d4, scale_factor=2, mode="bilinear", align_corners=False)
+        d3 = torch.cat([d3, e3], dim=1)
+        d3 = self.oca2(d3)
+        d3 = self.d3_res(d3)
+        aux2 = self.aux2(d3)
+        aux2_up = F.interpolate(aux2, scale_factor=4, mode="bilinear", align_corners=False)
+        
+        d2 = F.interpolate(d3, scale_factor=2, mode="bilinear", align_corners=False)
+        d2 = torch.cat([d2, e2], dim=1)
+        d2 = self.oca3(d2)
+        d2 = self.d2_res(d2)
+        aux3 = self.aux3(d2)
+        aux3_up = F.interpolate(aux3, scale_factor=2, mode="bilinear", align_corners=False)
+        
+        d1 = F.interpolate(d2, scale_factor=2, mode="bilinear", align_corners=False)
+        d1 = torch.cat([d1, e1], dim=1)
+        d1 = self.oca4(d1)
+        d1 = self.d1_res(d1)
+        main = self.main(d1)
+        
+        return main, aux1_up, aux2_up, aux3_up
+
+def build_roadattnet_core(base_filters=64, oca_length=9):
+    return RoadAttNetCore(base_filters=base_filters, oca_length=oca_length)
+
+class RoadAttNet(nn.Module):
+    def __init__(self, core: nn.Module):
+        super().__init__()
+        self.core = core
+        self.s1 = nn.Parameter(torch.zeros(1))
+        self.s2 = nn.Parameter(torch.zeros(1))
+        self.s3 = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        return self.core(x)
+
+    def compute_loss(self, y_true, main, aux1, aux2, aux3):
+        L_main = composite_loss(y_true, main)
+        L1 = composite_loss(y_true, aux1)
+        L2 = composite_loss(y_true, aux2)
+        L3 = composite_loss(y_true, aux3)
+        
+        s1 = torch.clamp(self.s1, min=-5.0, max=5.0)
+        s2 = torch.clamp(self.s2, min=-5.0, max=5.0)
+        s3 = torch.clamp(self.s3, min=-5.0, max=5.0)
+        
+        aux_term = (
+            0.5 * torch.exp(-2.0 * s1) * L1 + s1
+            + 0.5 * torch.exp(-2.0 * s2) * L2 + s2
+            + 0.5 * torch.exp(-2.0 * s3) * L3 + s3
+        )
+        
+        loss = L_main + aux_term
+        return loss, L_main, (L1 + L2 + L3) / 3.0

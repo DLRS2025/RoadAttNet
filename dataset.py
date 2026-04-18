@@ -6,10 +6,11 @@ from typing import List, Tuple
 
 import numpy as np
 import cv2
-import tensorflow as tf
+cv2.setNumThreads(0)
+import torch
+from torch.utils.data import Dataset, DataLoader
 
 from config import Config
-
 
 def _list_files(folder: str) -> List[str]:
     exts = ("*.tif", "*.tiff", "*.TIF", "*.TIFF")
@@ -18,11 +19,9 @@ def _list_files(folder: str) -> List[str]:
         out.extend(glob(os.path.join(folder, e)))
     return sorted(out)
 
-
 def _stem(path: str) -> str:
     base = os.path.basename(path)
     return re.sub(r"\.(tif|tiff|TIF|TIFF)$", "", base)
-
 
 def collect_pairs(rgb_dir: str, f1_dir: str, f2_dir: str, mask_dir: str) -> List[Tuple[str, str, str, str]]:
     rgb_files = _list_files(rgb_dir)
@@ -53,7 +52,6 @@ def collect_pairs(rgb_dir: str, f1_dir: str, f2_dir: str, mask_dir: str) -> List
     logging.info(f"Matched pairs: {len(pairs)}")
     return pairs
 
-
 def _normalize_to_01(img: np.ndarray) -> np.ndarray:
     img = img.astype(np.float32)
     mx = float(np.max(img)) if img.size else 0.0
@@ -62,7 +60,6 @@ def _normalize_to_01(img: np.ndarray) -> np.ndarray:
     if mx > 255.0:
         return img / 65535.0
     return img / 255.0
-
 
 def _read_rgb(path: str, H: int, W: int) -> np.ndarray:
     img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
@@ -77,7 +74,6 @@ def _read_rgb(path: str, H: int, W: int) -> np.ndarray:
     img = _normalize_to_01(img)
     return img.astype(np.float32)
 
-
 def _read_gray(path: str, H: int, W: int, interp) -> np.ndarray:
     img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
     if img is None:
@@ -88,89 +84,100 @@ def _read_gray(path: str, H: int, W: int, interp) -> np.ndarray:
     img = _normalize_to_01(img)
     return img[..., None].astype(np.float32)
 
-
 def _fuse_prior(f1: np.ndarray, f2: np.ndarray, mode: str) -> np.ndarray:
     if mode.lower() == "max":
         return np.maximum(f1, f2)
     return 0.5 * (f1 + f2)
 
-
-def load_sample_numpy(rgb_p: bytes, f1_p: bytes, f2_p: bytes, m_p: bytes,
+def load_sample_numpy(rgb_p: str, f1_p: str, f2_p: str, m_p: str,
                       H: int, W: int, prior_fuse: str):
-    rgb = _read_rgb(rgb_p.decode("utf-8"), H, W)
-    f1 = _read_gray(f1_p.decode("utf-8"), H, W, cv2.INTER_LINEAR)
-    f2 = _read_gray(f2_p.decode("utf-8"), H, W, cv2.INTER_LINEAR)
+    rgb = _read_rgb(rgb_p, H, W)
+    f1 = _read_gray(f1_p, H, W, cv2.INTER_LINEAR)
+    f2 = _read_gray(f2_p, H, W, cv2.INTER_LINEAR)
     prior = _fuse_prior(f1, f2, prior_fuse)
-    mask = _read_gray(m_p.decode("utf-8"), H, W, cv2.INTER_NEAREST)
+    mask = _read_gray(m_p, H, W, cv2.INTER_NEAREST)
     mask = (mask > 0.5).astype(np.float32)
     x = np.concatenate([rgb, prior], axis=-1).astype(np.float32)
     y = mask.astype(np.float32)
     return x, y
 
-
-def augment_tf(x: tf.Tensor, y: tf.Tensor):
-    r = tf.random.uniform([], 0, 1.0)
-    x = tf.cond(r < 0.5, lambda: tf.image.flip_left_right(x), lambda: x)
-    y = tf.cond(r < 0.5, lambda: tf.image.flip_left_right(y), lambda: y)
-
-    r = tf.random.uniform([], 0, 1.0)
-    x = tf.cond(r < 0.5, lambda: tf.image.flip_up_down(x), lambda: x)
-    y = tf.cond(r < 0.5, lambda: tf.image.flip_up_down(y), lambda: y)
-
-    k = tf.random.uniform([], minval=0, maxval=4, dtype=tf.int32)
-    x = tf.image.rot90(x, k)
-    y = tf.image.rot90(y, k)
-
+def augment_np(x: np.ndarray, y: np.ndarray):
+    # x: [H, W, C], y: [H, W, 1]
+    
+    if np.random.rand() < 0.5:
+        x = np.fliplr(x)
+        y = np.fliplr(y)
+        
+    if np.random.rand() < 0.5:
+        x = np.flipud(x)
+        y = np.flipud(y)
+        
+    k = np.random.randint(0, 4)
+    if k > 0:
+        x = np.rot90(x, k, axes=(0, 1))
+        y = np.rot90(y, k, axes=(0, 1))
+        
     rgb = x[..., :3]
     prior = x[..., 3:4]
+    
+    # color jitter on rgb
+    if np.random.rand() < 0.5:
+        delta = np.random.uniform(-0.08, 0.08)
+        rgb = np.clip(rgb + delta, 0.0, 1.0)
+        
+    if np.random.rand() < 0.5:
+        factor = np.random.uniform(0.9, 1.1)
+        mean = np.mean(rgb, axis=(0, 1), keepdims=True)
+        rgb = np.clip((rgb - mean) * factor + mean, 0.0, 1.0)
+        
+    if np.random.rand() < 0.5:
+        noise = np.random.normal(0, 0.01, size=rgb.shape).astype(np.float32)
+        rgb = np.clip(rgb + noise, 0.0, 1.0)
+        
+    x = np.concatenate([rgb, prior], axis=-1)
+    
+    # Ensure memory is contiguous after rotations/flips
+    return np.ascontiguousarray(x), np.ascontiguousarray(y)
 
-    rgb = tf.image.random_brightness(rgb, max_delta=0.08)
-    rgb = tf.image.random_contrast(rgb, lower=0.9, upper=1.1)
-    rgb = tf.clip_by_value(rgb, 0.0, 1.0)
+class RoadAttNetDataset(Dataset):
+    def __init__(self, pairs: List[Tuple[str, str, str, str]], cfg: Config, training: bool):
+        self.pairs = pairs
+        self.cfg = cfg
+        self.training = training
 
-    noise = tf.random.normal(tf.shape(rgb), mean=0.0, stddev=0.01, dtype=rgb.dtype)
-    rgb = tf.clip_by_value(rgb + noise, 0.0, 1.0)
+    def __len__(self):
+        return len(self.pairs)
 
-    x = tf.concat([rgb, prior], axis=-1)
-    return x, y
-
-
-def build_dataset(pairs: List[Tuple[str, str, str, str]], cfg: Config, training: bool) -> tf.data.Dataset:
-    rgb_list = [p[0] for p in pairs]
-    f1_list = [p[1] for p in pairs]
-    f2_list = [p[2] for p in pairs]
-    m_list = [p[3] for p in pairs]
-
-    ds = tf.data.Dataset.from_tensor_slices((rgb_list, f1_list, f2_list, m_list))
-    if training:
-        ds = ds.shuffle(buffer_size=min(len(pairs), 1024), seed=cfg.seed, reshuffle_each_iteration=True)
-
-    num_calls = tf.data.AUTOTUNE if cfg.num_parallel_calls == -1 else cfg.num_parallel_calls
-    H, W = cfg.img_height, cfg.img_width
-
-    def _load_map(rgb_p, f1_p, f2_p, m_p):
-        x, y = tf.numpy_function(
-            func=load_sample_numpy,
-            inp=[rgb_p, f1_p, f2_p, m_p, H, W, cfg.prior_fuse],
-            Tout=[tf.float32, tf.float32],
+    def __getitem__(self, idx):
+        rgb_p, f1_p, f2_p, m_p = self.pairs[idx]
+        x_np, y_np = load_sample_numpy(
+            rgb_p, f1_p, f2_p, m_p,
+            self.cfg.img_height, self.cfg.img_width, self.cfg.prior_fuse
         )
-        x.set_shape([H, W, cfg.img_channels])
-        y.set_shape([H, W, 1])
-        return x, y
+        
+        if self.training and self.cfg.augment:
+            x_np, y_np = augment_np(x_np, y_np)
+            
+        # Convert to CHW
+        x_tensor = torch.from_numpy(x_np).permute(2, 0, 1).float()
+        y_tensor = torch.from_numpy(y_np).permute(2, 0, 1).float()
+        
+        return x_tensor, y_tensor
 
-    ds = ds.map(_load_map, num_parallel_calls=num_calls)
-
-    if training and cfg.augment:
-        ds = ds.map(lambda x, y: augment_tf(x, y), num_parallel_calls=num_calls)
-
-    ds = ds.batch(cfg.batch_size, drop_remainder=training)
-
-    options = tf.data.Options()
-    options.experimental_deterministic = cfg.deterministic
-    ds = ds.with_options(options)
-
-    if (not training) and cfg.cache_val:
-        ds = ds.cache()
-
-    ds = ds.prefetch(tf.data.AUTOTUNE)
-    return ds
+def build_dataset(pairs: List[Tuple[str, str, str, str]], cfg: Config, training: bool) -> DataLoader:
+    if not pairs:
+        raise ValueError("No pairs were provided to build_dataset")
+        
+    ds = RoadAttNetDataset(pairs, cfg, training)
+    
+    num_workers = cfg.num_parallel_calls if cfg.num_parallel_calls > 0 else 0
+    loader = DataLoader(
+        ds,
+        batch_size=cfg.batch_size,
+        shuffle=training,
+        num_workers=num_workers,
+        pin_memory=True if torch.cuda.is_available() else False,
+        drop_last=False
+    )
+    
+    return loader

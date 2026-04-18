@@ -1,9 +1,18 @@
 import cv2
 import numpy as np
-import matplotlib.pyplot as plt
 from skimage import morphology
 from skimage.morphology import skeletonize, remove_small_objects
 import os
+
+
+def _normalize_to_uint8(img):
+    img = np.asarray(img, dtype=np.float32)
+    min_val = float(np.min(img))
+    max_val = float(np.max(img))
+    if not np.isfinite(min_val) or not np.isfinite(max_val) or max_val <= min_val:
+        return np.zeros_like(img, dtype=np.uint8)
+    img = 255.0 * (img - min_val) / (max_val - min_val)
+    return np.clip(img, 0, 255).astype(np.uint8)
 
 def display_all_features(image_path):
     """
@@ -264,9 +273,10 @@ def display_all_features(image_path):
     return features
 
 
-def feature_extraction(image_path, output_dir):
+def feature_extraction(image_path, cwl_out_dir, blurred_out_dir):
 
-    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(cwl_out_dir, exist_ok=True)
+    os.makedirs(blurred_out_dir, exist_ok=True)
 
     features = display_all_features(image_path)
     # Combine all features with specific weights
@@ -304,16 +314,13 @@ def feature_extraction(image_path, output_dir):
         combined_features += weight * feature_equalized.astype(np.float32)
     
     # Normalize the combined features to 0-255 range
-    min_val = np.min(combined_features)
-    max_val = np.max(combined_features)
-    if max_val > min_val:
-        combined_features = 255 * (combined_features - min_val) / (max_val - min_val)
+    combined_features = _normalize_to_uint8(combined_features).astype(np.float32)
     
     # Add the combined features to the features dictionary
     features['combined_all'] = combined_features.astype(np.float32)
     # 使用滤波器强化线状特征
     # 创建一个Gabor滤波器组来增强不同方向的线状特征
-    combined_gabor = np.zeros_like(combined_features)
+    combined_gabor = np.zeros_like(combined_features, dtype=np.float32)
     
     # 定义Gabor滤波器参数 - 针对3-20像素宽度的线状地物
     ksize = 80  # 滤波器大小，适合中等宽度的线状特征
@@ -325,12 +332,12 @@ def feature_extraction(image_path, output_dir):
     # 应用不同方向的Gabor滤波器
     for theta in np.arange(0, np.pi, np.pi/8):  # 8个不同方向
         gabor_kernel = cv2.getGaborKernel((ksize, ksize), sigma, theta, lambd, gamma, psi, ktype=cv2.CV_32F)
-        filtered = cv2.filter2D(combined_features.astype(np.uint8), cv2.CV_8UC3, gabor_kernel)
+        filtered = cv2.filter2D(combined_features.astype(np.float32), cv2.CV_32F, gabor_kernel)
         combined_gabor = np.maximum(combined_gabor, filtered)
     
     # 应用形态学操作进一步增强线状特征
     kernel_line = np.ones((3, 3), np.uint8)
-    enhanced_lines = cv2.morphologyEx(combined_gabor.astype(np.uint8), cv2.MORPH_CLOSE, kernel_line)
+    enhanced_lines = cv2.morphologyEx(_normalize_to_uint8(combined_gabor), cv2.MORPH_CLOSE, kernel_line)
     
     # 使用自适应阈值处理增强对比度
     enhanced_lines_thresh = cv2.adaptiveThreshold(
@@ -366,13 +373,9 @@ def feature_extraction(image_path, output_dir):
     
     # 保存结果时包含基本文件名
     # 将combined_with_lines映射到0-255
-    combined_with_lines = (features['combined_with_lines'] - np.min(features['combined_with_lines'])) / (np.max(features['combined_with_lines']) - np.min(features['combined_with_lines'])) * 255
-    combined_with_lines = combined_with_lines.astype(np.uint8)
-    # Create the subdirectory if it doesn't exist
-    cwl_dir = os.path.join(output_dir, "cwl")
-    if not os.path.exists(cwl_dir):
-        os.makedirs(cwl_dir)
-    cv2.imwrite(os.path.join(output_dir, "cwl", f"{base_name}.tiff"), combined_with_lines)
+    combined_with_lines = _normalize_to_uint8(features['combined_with_lines'])
+    cv2.imwrite(os.path.join(cwl_out_dir, f"{base_name}.tiff"), combined_with_lines)
+
     # 展示combined_all
     # plt.figure(figsize=(15, 10))
     # plt.imshow(features['combined_with_lines'], cmap='gray')
@@ -421,7 +424,8 @@ def feature_extraction(image_path, output_dir):
     gamma = 0.5        # 长宽比
     psi = 0            # 相位偏移
     gabor_kernel = cv2.getGaborKernel((ksize, ksize), sigma, theta, lamda, gamma, psi, ktype=cv2.CV_32F)
-    gabor_filtered = cv2.filter2D(blurred, cv2.CV_8UC3, gabor_kernel)
+    gabor_filtered = cv2.filter2D(blurred.astype(np.float32), cv2.CV_32F, gabor_kernel)
+    gabor_filtered = _normalize_to_uint8(gabor_filtered)
 
     # 5. 融合原图与 Gabor 滤波结果（加权平均，可调整权重）
     combined = cv2.addWeighted(blurred, 0.5, gabor_filtered, 0.5, 0)
@@ -444,17 +448,12 @@ def feature_extraction(image_path, output_dir):
 
 
     # 将blurred映射到0-255
-    blurred = (blurred - np.min(blurred)) / (np.max(blurred) - np.min(blurred)) * 255
-    blurred = blurred.astype(np.uint8)
-    # Create the subdirectory if it doesn't exist
-    blurred_dir = os.path.join(output_dir, "blurred")
-    if not os.path.exists(blurred_dir):
-        os.makedirs(blurred_dir)
+    blurred = _normalize_to_uint8(blurred)
+    cv2.imwrite(os.path.join(blurred_out_dir, f"{base_name}.tiff"), blurred)
+
     # cv2.imwrite(os.path.join(output_dir, f"{base_name}_skeleton.tiff"), skeleton)
     # cv2.imwrite(os.path.join(output_dir, f"{base_name}_combined.tiff"), combined)
     # cv2.imwrite(os.path.join(output_dir, f"{base_name}_enhanced.tiff"), enhanced)
-    cv2.imwrite(os.path.join(output_dir, "blurred", f"{base_name}.tiff"), blurred)
-    # cv2.imwrite(os.path.join(output_dir, f"{base_name}_gabor_filtered.tiff"), gabor_filtered)
 
     # # 10. 保存各步骤结果（可选）
     # cv2.imwrite("enhanced.png", enhanced)
@@ -482,8 +481,12 @@ def feature_extraction(image_path, output_dir):
 
 if __name__ == "__main__":
     # Replace with your actual image path
-    image_path = r"D:\YWWY\Projects\ZQproject\Road-extraction\archive\tiff\test\10378780_15.tiff"
-    output_dir = r"D:\YWWY\Projects\ZQproject\Road-extraction\archive\tiff"
+    image_path = "/mnt/d/YWWY/Projects/ZQproject/Road-extraction/archive/tiff/test/10378780_15.tiff"
+    output_dir = "/mnt/d/YWWY/Projects/ZQproject/Road-extraction/archive/tiff"
 
-    feature_extraction(image_path, output_dir)
+    feature_extraction(
+        image_path,
+        os.path.join(output_dir, "test_cwl"),
+        os.path.join(output_dir, "test_blurred"),
+    )
 
